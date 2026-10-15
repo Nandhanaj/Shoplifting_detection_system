@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SentinelShield AI // Real-Time Shoplifting & Concealment Detection</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2306B6D4' stroke-width='2'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/></svg>" />
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & Babel Standalone -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'monospace'],
+            sans: ['Inter', 'sans-serif']
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background-color: #070a12; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+    .cctv-scanlines {
+      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255,0,0,0.03), rgba(0,255,0,0.01), rgba(0,0,255,0.03));
+      background-size: 100% 3px, 6px 100%;
+      pointer-events: none;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0b0f19; }
+    ::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #06b6d4; }
+  </style>
+</head>
+<body class="selection:bg-cyan-500 selection:text-black">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // --- AUDIO SYNTHESIZER ENGINE ---
+    class WebAudioEngine {
+      constructor() { this.ctx = null; this.muted = false; }
+      init() {
+        if (!this.ctx && typeof window !== 'undefined') {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (AudioContext) this.ctx = new AudioContext();
+        }
+      }
+      playThreatAlert() {
+        if (this.muted) return;
+        try {
+          this.init();
+          if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+          const now = this.ctx.currentTime;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(880, now);
+          osc.frequency.setValueAtTime(1174.66, now + 0.12);
+          osc.frequency.setValueAtTime(880, now + 0.24);
+          osc.frequency.setValueAtTime(1174.66, now + 0.36);
+          gain.gain.setValueAtTime(0.12, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+          osc.start(now); osc.stop(now + 0.45);
+        } catch(e) {}
+      }
+      playAcknowledge() {
+        if (this.muted) return;
+        try {
+          this.init();
+          if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+          const now = this.ctx.currentTime;
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(523.25, now);
+          osc.frequency.setValueAtTime(659.25, now + 0.08);
+          gain.gain.setValueAtTime(0.08, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+          osc.connect(gain); gain.connect(this.ctx.destination);
+          osc.start(now); osc.stop(now + 0.2);
+        } catch(e) {}
+      }
+      playDeterrent(zone = "Zone 4") {
+        this.playAcknowledge();
+        if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(`Attention store personnel: Customer assistance requested in ${zone}. Surveillance active.`);
+          u.rate = 0.95; u.volume = 0.9;
+          setTimeout(() => window.speechSynthesis.speak(u), 200);
+        }
+      }
+    }
+    const soundEngine = new WebAudioEngine();
+
+    // --- DRAW HUD BOUNDING BOX ---
+    function drawHUDBox(ctx, box, label, score, threat = 'normal', isAlert = false) {
+      const [x, y, w, h] = box;
+      const stroke = isAlert ? '#EF4444' : threat === 'warning' ? '#F59E0B' : '#10B981';
+      const fill = isAlert ? 'rgba(239, 68, 68, 0.22)' : 'rgba(16, 185, 129, 0.08)';
+
+      ctx.save();
+      ctx.shadowColor = isAlert ? 'rgba(239, 68, 68, 0.85)' : 'rgba(16, 185, 129, 0.3)';
+      ctx.shadowBlur = isAlert ? 18 : 6;
+
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = isAlert ? 3 : 1.5;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = fill;
+      ctx.fillRect(x, y, w, h);
+
+      // Corner Brackets
+      const c = Math.min(18, w/4, h/4);
+      ctx.lineWidth = isAlert ? 3.5 : 2.5;
+      ctx.beginPath();
+      ctx.moveTo(x, y + c); ctx.lineTo(x, y); ctx.lineTo(x + c, y);
+      ctx.moveTo(x + w - c, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + c);
+      ctx.moveTo(x, y + h - c); ctx.lineTo(x, y + h); ctx.lineTo(x + c, y + h);
+      ctx.moveTo(x + w - c, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - c);
+      ctx.stroke();
+
+      // Crosshairs if in Alert
+      if (isAlert) {
+        const cx = x + w / 2;
+        const cy = y + h / 2;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
+        ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
+        ctx.stroke();
+      }
+
+      // Label Tag
+      const text = `${label.toUpperCase()} [${Math.round(score * 100)}%]`;
+      ctx.font = 'bold 11px monospace';
+      const textW = ctx.measureText(text).width;
+      const tagY = Math.max(0, y - 18);
+      ctx.fillStyle = stroke;
+      ctx.fillRect(x, tagY, textW + 10, 18);
+      ctx.fillStyle = '#070A12';
+      ctx.fillText(text, x + 5, tagY + 13);
+      ctx.restore();
+    }
+
+    // --- INITIAL DATA ---
+    const CAMERAS_INIT = [
+      { id: "CAM-01", name: "Aisle 04 // High-End Electronics", department: "Consumer Electronics", zone: "Zone B", risk: "CRITICAL", res: "1080p 30fps", feedType: "simulated", confidence: 0.94, scenario: "concealment", activeIncident: null },
+      { id: "CAM-02", name: "Aisle 07 // Luxury Perfume & Cosmetics", department: "Cosmetics & Fragrance", zone: "Zone C", risk: "HIGH", res: "1080p 30fps", feedType: "simulated", confidence: 0.91, scenario: "sweeping", activeIncident: null },
+      { id: "CAM-03", name: "Checkout Zone 02 // Self-Scan 04", department: "Self-Checkout", zone: "Zone A", risk: "HIGH", res: "4K 60fps", feedType: "simulated", confidence: 0.89, scenario: "checkout_bypass", activeIncident: null },
+      { id: "CAM-04", name: "Aisle 12 // Premium Whiskey & Liquor", department: "Spirits & Beverages", zone: "Zone D", risk: "MEDIUM", res: "1080p 30fps", feedType: "simulated", confidence: 0.87, scenario: "loitering", activeIncident: null },
+      { id: "CAM-05", name: "Apparel Perimeter // Fitting Stalls", department: "Designer Apparel", zone: "Zone E", risk: "MEDIUM", res: "1080p 30fps", feedType: "simulated", confidence: 0.85, scenario: "tag_tamper", activeIncident: null },
+      { id: "CAM-06", name: "Main Entrance // EAS Sensor Pedestals", department: "Store Front Exit", zone: "Zone F", risk: "CRITICAL", res: "4K 60fps", feedType: "simulated", confidence: 0.96, scenario: "exit_run", activeIncident: null }
+    ];
+
+    const INCIDENTS_INIT = [
+      { id: "INC-2026-881", timestamp: "2026-09-23 18:42", camera: "CAM-01", location: "Aisle 04 // High-End Electronics", behavior: "Pocket Concealment", description: "Suspect slipped 2x Wireless Earbuds into jacket pocket after checking camera angle.", severity: "CRITICAL", confidence: 0.94, status: "DISPATCHED", stolenEstimate: 349.99, suspectProfile: "Male, black hoodie, sling backpack", officerNotes: "Guard Sarah dispatched to intercept." },
+      { id: "INC-2026-879", timestamp: "2026-09-23 17:15", camera: "CAM-02", location: "Aisle 07 // Luxury Perfume", behavior: "Bulk Shelf Sweeping", description: "Suspect rapidly loaded 6x fragrance bottles into canvas tote.", severity: "HIGH", confidence: 0.92, status: "RESOLVED", stolenEstimate: 620.00, suspectProfile: "Female, beige trench coat", officerNotes: "PA deterrent sounded, suspect left merchandise." },
+      { id: "INC-2026-875", timestamp: "2026-09-23 15:08", camera: "CAM-03", location: "Checkout Zone 02 // Self-Scan 04", behavior: "Non-Scan Bagging", description: "Merchandise placed in bag while barcode obscured by palm.", severity: "MEDIUM", confidence: 0.88, status: "RESOLVED", stolenEstimate: 84.50, suspectProfile: "Male, denim jacket", officerNotes: "Cashier assisted customer to scan item." }
+    ];
+
+    const GUARDS = [
+      { id: "G-101", name: "Officer Sarah Vance", location: "Floor Zone B (Electronics)", status: "PATROLLING" },
+      { id: "G-102", name: "Officer Dave Martinez", location: "Front Registers & EAS", status: "DISPATCHED" },
+      { id: "G-103", name: "Officer Marcus Chen", location: "Control Room / CCTV", status: "MONITORING" }
+    ];
+
+    // --- ADAPTIVE SILHOUETTE & HAND-CONCEALMENT COMPUTER VISION ENGINE ---
+    function WebcamFeed({ camera, onThreatDetected }) {
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
+      const [cameraReady, setCameraReady] = useState(false);
+      const [isRedAlert, setIsRedAlert] = useState(false);
+      const [threatBehavior, setThreatBehavior] = useState("");
+      const [soundMuted, setSoundMuted] = useState(false);
+      const [activeMode, setActiveMode] = useState("auto"); // 'auto', 'pocket', 'hiding', 'sweeping'
+      const [debugLog, setDebugLog] = useState("Calibrating body tracker...");
+
+      // Computer Vision Memory
+      const visionRef = useRef({
+        prevFrame: null,
+        userSilhouetteBox: null, // Dynamic person bounding box (follows user anywhere in frame)
+        handCentroids: [],       // Tracks hand movements
+        handConcealedCount: 0,   // Number of frames hand remains tucked in clothing
+        isInThreatState: false,
+        lastAlertTime: 0,
+        threatHoldTimer: 0
+      });
+
+      // 1. Initialize Webcam
+      useEffect(() => {
+        let stream = null;
+        async function start() {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+              audio: false
+            });
+            if (videoRef.current) {
+              videoRef.current.srcObject = stream;
+              videoRef.current.play();
+              setCameraReady(true);
+              setDebugLog("Webcam Ready. Dynamic Body & Hand Tracker Active.");
+            }
+          } catch(e) {
+            setDebugLog("Camera access error. Please grant webcam permissions.");
+          }
+        }
+        start();
+        return () => { if (stream) stream.getTracks().forEach(t => t.stop()); };
+      }, []);
+
+      // 2. Adaptive Vision Processing Loop
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        const video = videoRef.current;
+        if (!canvas || !cameraReady) return;
+        const ctx = canvas.getContext('2d');
+        let animId;
+
+        // 160x120 downscaled canvas for real-time silhouette extraction
+        const sCanvas = document.createElement('canvas');
+        sCanvas.width = 160;
+        sCanvas.height = 120;
+        const sCtx = sCanvas.getContext('2d', { willReadFrequently: true });
+
+        const processFrame = () => {
+          if (video && video.readyState === 4) {
+            const w = video.videoWidth || 640;
+            const h = video.videoHeight || 480;
+            if (canvas.width !== w || canvas.height !== h) {
+              canvas.width = w;
+              canvas.height = h;
+            }
+
+            ctx.clearRect(0, 0, w, h);
+
+            // Capture current frame
+            sCtx.drawImage(video, 0, 0, 160, 120);
+            const currentPixels = sCtx.getImageData(0, 0, 160, 120).data;
+            const vState = visionRef.current;
+
+            // 1. DYNAMIC BODY SILHOUETTE FINDER
+            // Instead of a static hardcoded box, find where the user actually is!
+            let minX = 160, maxX = 0, minY = 120, maxY = 0;
+            let activeMotionPixels = 0;
+            let handMotionX = 0, handMotionY = 0, handPixelCount = 0;
+
+            if (vState.prevFrame) {
+              const pData = vState.prevFrame;
+
+              for (let sy = 10; sy < 110; sy += 2) {
+                for (let sx = 10; sx < 150; sx += 2) {
+                  const idx = (sy * 160 + sx) * 4;
+                  const delta = Math.abs(currentPixels[idx] - pData[idx]) +
+                                Math.abs(currentPixels[idx+1] - pData[idx+1]) +
+                                Math.abs(currentPixels[idx+2] - pData[idx+2]);
+
+                  // Pixel movement threshold
+                  if (delta > 70) {
+                    activeMotionPixels++;
+                    if (sx < minX) minX = sx;
+                    if (sx > maxX) maxX = sx;
+                    if (sy < minY) minY = sy;
+                    if (sy > maxY) maxY = sy;
+
+                    // Hand / fast motion tracker
+                    if (delta > 110) {
+                      handMotionX += sx;
+                      handMotionY += sy;
+                      handPixelCount++;
+                    }
+                  }
+                }
+              }
+            }
+            vState.prevFrame = currentPixels;
+
+            // Smooth dynamic body box
+            if (activeMotionPixels > 25 && minX < maxX && minY < maxY) {
+              const targetW = Math.max(w * 0.40, (maxX - minX + 20) * (w / 160));
+              const targetH = Math.max(h * 0.65, (maxY - minY + 25) * (h / 120));
+              const targetX = Math.max(10, Math.min(w - targetW - 10, (minX - 10) * (w / 160)));
+              const targetY = Math.max(10, Math.min(h - targetH - 10, (minY - 10) * (h / 120)));
+
+              if (!vState.userSilhouetteBox) {
+                vState.userSilhouetteBox = [targetX, targetY, targetW, targetH];
+              } else {
+                // Smooth interpolation to prevent jittering
+                vState.userSilhouetteBox[0] = vState.userSilhouetteBox[0] * 0.85 + targetX * 0.15;
+                vState.userSilhouetteBox[1] = vState.userSilhouetteBox[1] * 0.85 + targetY * 0.15;
+                vState.userSilhouetteBox[2] = vState.userSilhouetteBox[2] * 0.85 + targetW * 0.15;
+                vState.userSilhouetteBox[3] = vState.userSilhouetteBox[3] * 0.85 + targetH * 0.15;
+              }
+            }
+
+            // Fallback default box if user hasn't moved yet
+            const bodyBox = vState.userSilhouetteBox || [w * 0.25, h * 0.10, w * 0.50, h * 0.80];
+            const [bx, by, bw, bh] = bodyBox;
+
+            // DYNAMIC CLOTHING / POCKET / CONCEALMENT ZONE (Adjusts dynamically to real body!)
+            const pocketY1 = by + bh * 0.48;
+            const pocketY2 = by + bh * 0.98;
+            const pocketX1 = bx + bw * 0.08;
+            const pocketX2 = bx + bw * 0.92;
+
+            // 2. THEFT GESTURE DETECTION (Hand entering clothing or pocket)
+            let isSuspiciousConcealment = false;
+            let currentDetectedBehavior = "";
+
+            if (handPixelCount > 15) {
+              const hX = (handMotionX / handPixelCount) * (w / 160);
+              const hY = (handMotionY / handPixelCount) * (h / 120);
+
+              vState.handCentroids.push({ x: hX, y: hY, time: Date.now() });
+              if (vState.handCentroids.length > 8) vState.handCentroids.shift();
+
+              // Evaluate Directional Hand Trajectory over last ~200ms
+              if (vState.handCentroids.length >= 4) {
+                const startPt = vState.handCentroids[0];
+                const endPt = vState.handCentroids[vState.handCentroids.length - 1];
+                const downwardMovement = endPt.y - startPt.y;
+
+                // CRITERIA FOR CONCEALMENT:
+                // Hand moves downward into the pocket/waistband zone OR inside jacket
+                const isInsideConcealmentZone = endPt.y >= pocketY1 && endPt.y <= pocketY2 && endPt.x >= pocketX1 && endPt.x <= pocketX2;
+
+                if (downwardMovement > 16 && isInsideConcealmentZone) {
+                  isSuspiciousConcealment = true;
+                  currentDetectedBehavior = "Concealment in Clothing / Pocket";
+                }
+              }
+            }
+
+            // Check if alert should be held
+            const now = Date.now();
+            if (isSuspiciousConcealment) {
+              vState.threatHoldTimer = now + 3000; // Hold alert for 3 seconds
+              setThreatBehavior(currentDetectedBehavior);
+            }
+
+            const inAlert = now < vState.threatHoldTimer;
+            setIsRedAlert(inAlert);
+
+            // 3. RENDER HUD BOUNDING BOX
+            if (inAlert) {
+              // --- SUSPICIOUS THEFT FLAGGED (RED) ---
+              drawHUDBox(ctx, bodyBox, `! SUSPECT: ${threatBehavior || 'CONCEALMENT DETECTED'} !`, 0.96, 'alert', true);
+
+              // Highlight Concealment Pocket Zone in Red
+              ctx.save();
+              ctx.strokeStyle = '#EF4444';
+              ctx.fillStyle = 'rgba(239, 68, 68, 0.35)';
+              ctx.lineWidth = 3;
+              ctx.setLineDash([8, 6]);
+              ctx.strokeRect(pocketX1, pocketY1, pocketX2 - pocketX1, pocketY2 - pocketY1);
+              ctx.fillRect(pocketX1, pocketY1, pocketX2 - pocketX1, pocketY2 - pocketY1);
+              ctx.font = 'bold 11px monospace';
+              ctx.fillStyle = '#FFFFFF';
+              ctx.fillText('⚡ CRITICAL: HAND-TO-POCKET THEFT DETECTED ⚡', pocketX1 + 10, pocketY1 + 22);
+              ctx.restore();
+
+              // Trigger Sound Once on leading edge
+              if (!vState.isInThreatState) {
+                vState.isInThreatState = true;
+                if (!soundMuted) soundEngine.playThreatAlert();
+                if (onThreatDetected) {
+                  onThreatDetected({
+                    cameraId: camera.id,
+                    behavior: threatBehavior || "Pocket Concealment",
+                    confidence: 0.96,
+                    description: "Subject reached downward into pocket/waistband concealing item."
+                  });
+                }
+              }
+            } else {
+              // --- NORMAL PATRON BROWSING (GREEN) ---
+              vState.isInThreatState = false;
+              drawHUDBox(ctx, bodyBox, 'PATRON // BROWSING NORMALLY', 0.92, 'normal', false);
+
+              // Draw Cyan Pocket Sensor Zone
+              ctx.save();
+              ctx.strokeStyle = 'rgba(6, 182, 212, 0.4)';
+              ctx.lineWidth = 1.5;
+              ctx.setLineDash([6, 6]);
+              ctx.strokeRect(pocketX1, pocketY1, pocketX2 - pocketX1, pocketY2 - pocketY1);
+              ctx.fillStyle = 'rgba(6, 182, 212, 0.04)';
+              ctx.fillRect(pocketX1, pocketY1, pocketX2 - pocketX1, pocketY2 - pocketY1);
+
+              ctx.font = '10px monospace';
+              ctx.fillStyle = '#38BDF8';
+              ctx.fillText('CLOTHING CONCEALMENT SENSOR ZONE [STANDBY]', pocketX1 + 8, pocketY1 + 16);
+              ctx.restore();
+            }
+
+            // Top Status Overlay
+            ctx.fillStyle = 'rgba(7, 10, 18, 0.9)';
+            ctx.fillRect(10, 10, 380, 24);
+            ctx.font = 'bold 11px monospace';
+            ctx.fillStyle = inAlert ? '#EF4444' : '#10B981';
+            ctx.fillText(
+              inAlert ? `[!] THREAT FLAGGED: CONCEALMENT DETECTED [!]` : `PERIMETER SECURE // BODY TRACKING ACTIVE`,
+              16, 26
+            );
+          }
+          animId = requestAnimationFrame(processFrame);
+        };
+
+        animId = requestAnimationFrame(processFrame);
+        return () => cancelAnimationFrame(animId);
+      }, [cameraReady, camera, onThreatDetected, soundMuted, threatBehavior]);
+
+      // Trigger Specific Theft Gesture Test (Instant Demonstration)
+      const triggerSimulatedAction = (behaviorName) => {
+        visionRef.current.threatHoldTimer = Date.now() + 4000;
+        setThreatBehavior(behaviorName);
+        setIsRedAlert(true);
+        if (!soundMuted) soundEngine.playThreatAlert();
+        if (onThreatDetected) {
+          onThreatDetected({
+            cameraId: camera.id,
+            behavior: behaviorName,
+            confidence: 0.96,
+            description: `Subject observed performing suspicious action: ${behaviorName}.`
+          });
+        }
+      };
+
+      return (
+        <div className="relative w-full h-full bg-slate-950 flex items-center justify-center overflow-hidden">
+          <video ref={videoRef} playsInline muted autoPlay className="w-full h-full object-cover" />
+          <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
+          <div className="absolute inset-0 cctv-scanlines pointer-events-none opacity-20"></div>
+
+          {/* Interactive Shoplifting Gesture Action Deck */}
+          <div className="absolute bottom-2 left-2 right-2 bg-black/90 backdrop-blur-md border border-gray-800 rounded-xl p-2.5 flex flex-wrap items-center justify-between text-xs font-mono gap-2 z-30 shadow-2xl">
+            
+            {/* Real-Time Live Status Pill */}
+            <div className="flex items-center space-x-2">
+              <span className={`w-3 h-3 rounded-full ${isRedAlert ? 'bg-red-500 animate-ping' : 'bg-emerald-500'}`}></span>
+              <span className="text-gray-200 font-bold text-xs">STATUS:</span>
+              <span className={`font-bold text-xs px-2 py-0.5 rounded ${
+                isRedAlert ? 'bg-red-950 text-red-400 border border-red-700 animate-pulse' : 
+                'bg-emerald-950 text-emerald-400 border border-emerald-800'
+              }`}>
+                {isRedAlert ? 'SUSPICIOUS ACTIVITY FLAGGED' : 'NORMAL (0% RISK)'}
+              </span>
+            </div>
+
+            {/* Test Specific Actions */}
+            <div className="flex items-center space-x-1.5 flex-wrap">
+              <span className="text-[10px] text-gray-400 mr-1 hidden sm:inline">Test Theft Actions:</span>
+              
+              <button
+                onClick={() => triggerSimulatedAction("Pocket Concealment")}
+                className="px-2 py-1 rounded bg-red-600/90 hover:bg-red-500 text-white font-bold text-[10px] transition-all shadow"
+                title="Simulate pocketing an item"
+              >
+                ⚡ Pocket Item
+              </button>
+
+              <button
+                onClick={() => triggerSimulatedAction("Shelf Sweeping")}
+                className="px-2 py-1 rounded bg-amber-600/90 hover:bg-amber-500 text-white font-bold text-[10px] transition-all shadow"
+                title="Simulate bulk grabbing items"
+              >
+                ⚡ Shelf Sweep
+              </button>
+
+              <button
+                onClick={() => triggerSimulatedAction("Barcode Scan Bypass")}
+                className="px-2 py-1 rounded bg-indigo-600/90 hover:bg-indigo-500 text-white font-bold text-[10px] transition-all shadow"
+                title="Simulate checkout bypass"
+              >
+                ⚡ Non-Scan Bag
+              </button>
+
+              {/* Sound Toggle */}
+              <button
+                onClick={() => setSoundMuted(!soundMuted)}
+                className={`px-2 py-1 rounded border text-[10px] font-bold ${
+                  soundMuted ? 'bg-gray-800 text-gray-400 border-gray-700' : 'bg-cyan-500/20 text-cyan-300 border-cyan-600'
+                }`}
+              >
+                {soundMuted ? '🔇 Muted' : '🔊 Sound'}
+              </button>
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    // --- SIMULATED CCTV CANVAS ---
+    function CanvasFeed({ camera }) {
+      const canvasRef = useRef(null);
+      const stateRef = useRef({
+        frame: 0,
+        personX: 100,
+        vx: 0.6,
+        itemOnShelf: true
+      });
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        let animId;
+
+        const render = () => {
+          const state = stateRef.current;
+          state.frame++;
+          const w = canvas.width;
+          const h = canvas.height;
+          const isThreat = !!camera.activeIncident;
+
+          ctx.fillStyle = '#0a0f1d';
+          ctx.fillRect(0, 0, w, h);
+
+          // Floor tiles
+          ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+          for (let i = 0; i <= w; i += 40) {
+            ctx.beginPath(); ctx.moveTo(i, h * 0.4); ctx.lineTo(i * 1.6 - w * 0.3, h); ctx.stroke();
+          }
+
+          // Shelves
+          ctx.fillStyle = '#161f33';
+          ctx.fillRect(10, 40, 60, h * 0.7);
+          ctx.fillRect(w - 70, 40, 60, h * 0.7);
+
+          // Center Display Island
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(160, 90, 110, 80);
+          ctx.fillStyle = '#38bdf8';
+          if (state.itemOnShelf) {
+            ctx.fillRect(180, 100, 14, 20);
+            ctx.fillRect(205, 100, 14, 20);
+            ctx.fillRect(230, 100, 14, 20);
+          }
+
+          // Move person
+          if (!isThreat) {
+            state.personX += state.vx;
+            if (state.personX < 80 || state.personX > w - 120) state.vx *= -1;
+            state.itemOnShelf = true;
+          } else {
+            if (state.personX < 140) state.personX += 0.8;
+            state.itemOnShelf = false;
+          }
+
+          const px = state.personX;
+          const py = 110;
+          const pw = 55;
+          const ph = 130;
+
+          // Head
+          ctx.fillStyle = isThreat ? '#EF4444' : '#94A3B8';
+          ctx.beginPath(); ctx.arc(px + pw/2, py + 16, 12, 0, Math.PI*2); ctx.fill();
+
+          // Body
+          ctx.fillStyle = isThreat ? '#991B1B' : '#334155';
+          ctx.fillRect(px + 10, py + 30, pw - 20, 50);
+
+          // Legs
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(px + 12, py + 80, 10, 45);
+          ctx.fillRect(px + pw - 22, py + 80, 10, 45);
+
+          // Arms
+          ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 4;
+          ctx.beginPath();
+          if (isThreat) {
+            ctx.moveTo(px + 12, py + 35);
+            ctx.lineTo(px + 28, py + 55);
+            ctx.lineTo(px + 20, py + 65);
+          } else {
+            ctx.moveTo(px + 10, py + 35); ctx.lineTo(px + 8, py + 70);
+            ctx.moveTo(px + pw - 10, py + 35); ctx.lineTo(px + pw - 8, py + 70);
+          }
+          ctx.stroke();
+
+          // HUD Box
+          const pBox = [px, py, pw, ph];
+          if (isThreat) {
+            drawHUDBox(ctx, pBox, `! SUSPECT: ${camera.activeIncident.behavior}`, camera.activeIncident.confidence, 'alert', true);
+            ctx.save();
+            ctx.strokeStyle = '#EF4444';
+            ctx.setLineDash([3, 3]);
+            ctx.strokeRect(px + 6, py + 40, pw - 12, 35);
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+            ctx.fillRect(px + 6, py + 40, pw - 12, 35);
+            ctx.restore();
+          } else {
+            drawHUDBox(ctx, pBox, 'PATRON #104', 0.92, 'normal', false);
+          }
+
+          // CCTV OSD
+          ctx.fillStyle = 'rgba(0,0,0,0.5)';
+          ctx.fillRect(6, 6, 200, 20);
+          ctx.fillStyle = '#10B981';
+          ctx.font = '10px monospace';
+          ctx.fillText(`● REC [${camera.id}] ${camera.res}`, 12, 20);
+
+          animId = requestAnimationFrame(render);
+        };
+
+        render();
+        return () => cancelAnimationFrame(animId);
+      }, [camera]);
+
+      return (
+        <div className="relative w-full h-full bg-black">
+          <canvas ref={canvasRef} width={420} height={240} className="w-full h-full object-cover" />
+          <div className="absolute inset-0 cctv-scanlines pointer-events-none opacity-40"></div>
+        </div>
+      );
+    }
+
+    // --- MAIN APP ROOT COMPONENT ---
+    function App() {
+      const [currentTab, setCurrentTab] = useState('surveillance');
+      const [cameras, setCameras] = useState(CAMERAS_INIT);
+      const [incidents, setIncidents] = useState(INCIDENTS_INIT);
+      const [activeAlerts, setActiveAlerts] = useState([]);
+      const [threatLevel, setThreatLevel] = useState('NORMAL');
+      const [selectedAlertForDispatch, setSelectedAlertForDispatch] = useState(null);
+      const [dispatchGuardId, setDispatchGuardId] = useState(GUARDS[0].id);
+      const [dispatchNotes, setDispatchNotes] = useState("Intercept suspect calmly. Check for concealed items.");
+
+      useEffect(() => {
+        if (activeAlerts.some(a => a.severity === 'CRITICAL')) setThreatLevel('CRITICAL');
+        else if (activeAlerts.length > 0) setThreatLevel('ELEVATED');
+        else setThreatLevel('NORMAL');
+      }, [activeAlerts]);
+
+      const triggerThreat = (camId) => {
+        const cam = cameras.find(c => c.id === camId) || cameras[0];
+        const newId = `INC-2026-${Math.floor(1000 + Math.random()*9000)}`;
+        const time = new Date().toLocaleTimeString();
+
+        let behavior = "Pocket Concealment";
+        let sev = "CRITICAL";
+        let val = 249.99;
+        if (cam.scenario === 'sweeping') { behavior = "Bulk Shelf Sweeping"; val = 580.00; }
+        else if (cam.scenario === 'checkout_bypass') { behavior = "Non-Scan Bagging"; sev = "HIGH"; val = 89.50; }
+
+        const alertItem = {
+          id: newId,
+          timestamp: `Today ${time}`,
+          camera: cam.id,
+          location: cam.name,
+          behavior,
+          description: `Suspicious behavior flagged: ${behavior} observed on camera feed.`,
+          severity: sev,
+          confidence: cam.confidence,
+          status: 'ACTIVE',
+          stolenEstimate: val,
+          suspectProfile: "Subject in dark jacket near main display rack."
+        };
+
+        setCameras(prev => prev.map(c => c.id === cam.id ? { ...c, activeIncident: alertItem } : c));
+        setActiveAlerts(prev => [alertItem, ...prev]);
+        soundEngine.playThreatAlert();
+      };
+
+      const handleWebcamThreatDetected = ({ cameraId, behavior, confidence, description }) => {
+        const targetCam = cameras.find(c => c.id === cameraId) || cameras[0];
+        const newId = `INC-LIVE-${Math.floor(1000 + Math.random()*9000)}`;
+        const time = new Date().toLocaleTimeString();
+
+        const alertItem = {
+          id: newId,
+          timestamp: `Today ${time}`,
+          camera: targetCam.id,
+          location: `${targetCam.name} (Live Camera)`,
+          behavior,
+          description,
+          severity: "CRITICAL",
+          confidence,
+          status: "ACTIVE",
+          stolenEstimate: 199.99,
+          suspectProfile: "Subject observed on live camera."
+        };
+
+        setCameras(prev => prev.map(c => c.id === targetCam.id ? { ...c, activeIncident: alertItem } : c));
+        setActiveAlerts(prev => [alertItem, ...prev]);
+      };
+
+      const toggleFeed = (camId) => {
+        setCameras(prev => prev.map(c => c.id === camId ? { ...c, feedType: c.feedType === 'webcam' ? 'simulated' : 'webcam' } : c));
+        soundEngine.playAcknowledge();
+      };
+
+      const dispatchGuard = () => {
+        if (!selectedAlertForDispatch) return;
+        const alertId = selectedAlertForDispatch.id;
+        const guard = GUARDS.find(g => g.id === dispatchGuardId);
+
+        setIncidents(prev => [{
+          ...selectedAlertForDispatch,
+          status: 'DISPATCHED',
+          officerNotes: `Dispatched to ${guard.name}. ${dispatchNotes}`
+        }, ...prev]);
+
+        setActiveAlerts(prev => prev.filter(a => a.id !== alertId));
+        setCameras(prev => prev.map(c => c.activeIncident?.id === alertId ? { ...c, activeIncident: null } : c));
+        setSelectedAlertForDispatch(null);
+        soundEngine.playAcknowledge();
+      };
+
+      const dismissAlert = (alertId) => {
+        const item = activeAlerts.find(a => a.id === alertId);
+        if (item) setIncidents(prev => [{ ...item, status: 'FALSE_ALARM' }, ...prev]);
+        setActiveAlerts(prev => prev.filter(a => a.id !== alertId));
+        setCameras(prev => prev.map(c => c.activeIncident?.id === alertId ? { ...c, activeIncident: null } : c));
+        soundEngine.playAcknowledge();
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col bg-[#070A12] text-slate-100">
+          {/* Header */}
+          <header className="bg-[#0B0F19] border-b border-gray-800 px-4 py-3 sticky top-0 z-40">
+            <div className="max-w-[1800px] mx-auto flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center space-x-3">
+                <div className="w-9 h-9 rounded-lg bg-cyan-600 flex items-center justify-center font-bold text-white shadow-lg shadow-cyan-500/20">
+                  🛡️
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <span className="font-bold text-base tracking-wider text-white">SENTINELSHIELD</span>
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-400 border border-cyan-800 font-mono">AI v2.4</span>
+                  </div>
+                  <p className="text-[11px] text-gray-400 font-mono">ADAPTIVE RETAIL LOSS PREVENTION & THEFT SURVEILLANCE</p>
+                </div>
+
+                <div className={`ml-3 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold border ${
+                  threatLevel === 'CRITICAL' ? 'bg-red-950 text-red-400 border-red-700 animate-pulse' :
+                  threatLevel === 'ELEVATED' ? 'bg-amber-950 text-amber-400 border-amber-700' :
+                  'bg-emerald-950 text-emerald-400 border-emerald-800'
+                }`}>
+                  THREAT: {threatLevel}
+                </div>
+              </div>
+
+              {/* Navigation Tabs */}
+              <nav className="flex items-center space-x-1 bg-gray-900/80 p-1 rounded-xl border border-gray-800 text-xs">
+                <button
+                  onClick={() => setCurrentTab('surveillance')}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${currentTab === 'surveillance' ? 'bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40' : 'text-gray-400 hover:text-white'}`}
+                >
+                  📹 Surveillance Grid (6 Feeds)
+                </button>
+                <button
+                  onClick={() => setCurrentTab('alerts')}
+                  className={`px-3 py-1.5 rounded-lg transition-all relative ${currentTab === 'alerts' ? 'bg-red-500/20 text-red-300 font-bold border border-red-500/40' : 'text-gray-400 hover:text-white'}`}
+                >
+                  ⚡ Active Threats {activeAlerts.length > 0 && <span className="ml-1 px-1.5 py-0.2 rounded-full bg-red-600 text-white text-[10px] animate-pulse">{activeAlerts.length}</span>}
+                </button>
+                <button
+                  onClick={() => setCurrentTab('vault')}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${currentTab === 'vault' ? 'bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40' : 'text-gray-400 hover:text-white'}`}
+                >
+                  📁 Evidence Vault ({incidents.length})
+                </button>
+                <button
+                  onClick={() => setCurrentTab('analytics')}
+                  className={`px-3 py-1.5 rounded-lg transition-all ${currentTab === 'analytics' ? 'bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40' : 'text-gray-400 hover:text-white'}`}
+                >
+                  📊 Store Analytics
+                </button>
+              </nav>
+
+              {/* Actions */}
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => triggerThreat(cameras[Math.floor(Math.random() * cameras.length)].id)}
+                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-md shadow-red-600/30 transition-all active:scale-95"
+                >
+                  ⚡ Simulate Incident
+                </button>
+                <button
+                  onClick={() => soundEngine.playDeterrent("Electronics Aisle")}
+                  className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-cyan-300 border border-cyan-800 text-xs font-medium"
+                >
+                  📢 PA Deterrent
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main View Area */}
+          <main className="flex-1 p-4 sm:p-6 max-w-[1800px] w-full mx-auto">
+            {currentTab === 'surveillance' && (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between text-xs text-gray-300 font-mono bg-cyan-950/30 p-3 rounded-xl border border-cyan-800/60">
+                  <div className="flex items-center space-x-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+                    <span className="font-bold text-white">ADAPTIVE SENSOR CALIBRATED:</span>
+                    <span>Standing still will <strong className="text-emerald-400">NEVER trigger an alarm</strong>.</span>
+                  </div>
+                  <span className="text-amber-400">⚡ Put your hand into your pocket/jacket, or use the quick action buttons on the camera to test!</span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {cameras.map(cam => (
+                    <div key={cam.id} className={`rounded-xl overflow-hidden bg-gray-900 border flex flex-col transition-all duration-200 ${
+                      cam.activeIncident ? 'border-red-500 shadow-xl shadow-red-500/40 ring-2 ring-red-500' : 'border-gray-800'
+                    }`}>
+                      {/* Top Bar */}
+                      <div className="bg-[#0B0F19] px-3 py-2 border-b border-gray-800 flex items-center justify-between text-xs">
+                        <div className="flex items-center space-x-2">
+                          <span className={`w-2 h-2 rounded-full ${cam.activeIncident ? 'bg-red-500 animate-ping' : 'bg-emerald-500'}`}></span>
+                          <span className="font-mono font-bold text-white">{cam.id}</span>
+                          <span className="text-gray-400 truncate max-w-[130px]">{cam.name}</span>
+                        </div>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                          cam.risk === 'CRITICAL' ? 'bg-red-950 text-red-400 border border-red-800' : 'bg-amber-950 text-amber-400 border border-amber-800'
+                        }`}>{cam.risk}</span>
+                      </div>
+
+                      {/* Video/Canvas */}
+                      <div className="relative aspect-video w-full bg-black">
+                        {cam.feedType === 'webcam' ? (
+                          <WebcamFeed camera={cam} onThreatDetected={handleWebcamThreatDetected} />
+                        ) : (
+                          <CanvasFeed camera={cam} />
+                        )}
+
+                        {cam.activeIncident && (
+                          <div className="absolute top-2 left-2 right-2 bg-red-600/90 text-white px-2.5 py-1 rounded text-xs font-mono font-bold flex justify-between items-center shadow-lg animate-pulse z-20">
+                            <span>! {cam.activeIncident.behavior} !</span>
+                            <span>{Math.round(cam.activeIncident.confidence * 100)}%</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Footer Actions */}
+                      <div className="bg-[#0B0F19] px-3 py-2 border-t border-gray-800/80 flex items-center justify-between text-xs">
+                        <div className="flex space-x-1.5">
+                          <button
+                            onClick={() => triggerThreat(cam.id)}
+                            className="px-2 py-1 rounded bg-red-600/80 hover:bg-red-500 text-white text-[11px] font-bold shadow"
+                          >
+                            Simulate Threat
+                          </button>
+                          <button
+                            onClick={() => toggleFeed(cam.id)}
+                            className={`px-2.5 py-1 rounded text-[11px] font-mono font-bold border transition-all ${
+                              cam.feedType === 'webcam' 
+                                ? 'bg-cyan-500 text-black border-cyan-400 shadow-md shadow-cyan-500/30' 
+                                : 'bg-gray-800 hover:bg-gray-700 text-cyan-400 border-gray-700'
+                            }`}
+                          >
+                            {cam.feedType === 'webcam' ? '✓ Webcam Live' : 'Use Webcam'}
+                          </button>
+                        </div>
+                        <span className="text-[10px] font-mono text-gray-500">{cam.res}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {currentTab === 'alerts' && (
+              <div className="space-y-4 max-w-4xl mx-auto">
+                <div className="bg-gray-900/80 p-4 rounded-xl border border-gray-800 flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-bold text-white">ACTIVE THREAT STREAM</h2>
+                    <p className="text-xs text-gray-400">Review suspicious shoplifting behaviors flagged by AI.</p>
+                  </div>
+                  <span className="text-xs font-mono text-red-400 bg-red-950 px-2.5 py-1 rounded border border-red-800 font-bold">
+                    {activeAlerts.length} THREATS UNRESOLVED
+                  </span>
+                </div>
+
+                {activeAlerts.length === 0 ? (
+                  <div className="bg-gray-900/40 border border-gray-800 rounded-2xl p-12 text-center text-gray-400">
+                    <p className="text-base font-semibold text-gray-300">All Store Zones Secure</p>
+                    <p className="text-xs mt-1">Zero pending shoplifting alerts.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {activeAlerts.map(alert => (
+                      <div key={alert.id} className="p-4 rounded-xl bg-gray-900 border border-red-500/60 shadow-lg space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center space-x-2">
+                            <span className="text-xs font-mono font-bold bg-black px-2 py-0.5 rounded text-white border border-gray-700">{alert.camera}</span>
+                            <span className="text-xs font-semibold text-white">{alert.location}</span>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-red-600 text-white font-bold">{alert.severity}</span>
+                            <span className="text-[10px] font-mono text-cyan-400">CONF: {Math.round(alert.confidence*100)}%</span>
+                          </div>
+                          <span className="text-xs font-mono text-gray-400">{alert.timestamp}</span>
+                        </div>
+
+                        <div>
+                          <h4 className="text-sm font-bold text-red-400 uppercase">{alert.behavior}</h4>
+                          <p className="text-xs text-gray-300 font-mono mt-0.5">{alert.description}</p>
+                        </div>
+
+                        <div className="flex items-center justify-end space-x-2 pt-2 border-t border-gray-800 text-xs">
+                          <button
+                            onClick={() => setSelectedAlertForDispatch(alert)}
+                            className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold"
+                          >
+                            Dispatch Floor Guard
+                          </button>
+                          <button
+                            onClick={() => soundEngine.playDeterrent(alert.location)}
+                            className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-cyan-300 border border-cyan-800 font-medium"
+                          >
+                            Play PA Deterrent
+                          </button>
+                          <button
+                            onClick={() => dismissAlert(alert.id)}
+                            className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 font-mono"
+                          >
+                            Dismiss (False Alarm)
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {currentTab === 'vault' && (
+              <div className="space-y-4 max-w-6xl mx-auto">
+                <div className="bg-gray-900/80 p-4 rounded-xl border border-gray-800 flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-bold text-white">INCIDENT EVIDENCE VAULT</h2>
+                    <p className="text-xs text-gray-400 font-mono">OFFICIAL LOSS PREVENTION AUDIT LOG</p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const blob = new Blob([JSON.stringify(incidents, null, 2)], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a'); a.href = url; a.download = 'incidents.json'; a.click();
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-cyan-400 border border-cyan-800 text-xs font-mono"
+                  >
+                    Export JSON Report
+                  </button>
+                </div>
+
+                <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-gray-950 text-gray-400 font-mono border-b border-gray-800 text-[11px] uppercase">
+                        <th className="p-3">ID</th>
+                        <th className="p-3">Time</th>
+                        <th className="p-3">Camera</th>
+                        <th className="p-3">Behavior</th>
+                        <th className="p-3">Severity</th>
+                        <th className="p-3">Est. Value</th>
+                        <th className="p-3">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-800 font-mono">
+                      {incidents.map(inc => (
+                        <tr key={inc.id} className="hover:bg-gray-800/40">
+                          <td className="p-3 text-cyan-400 font-bold">{inc.id}</td>
+                          <td className="p-3 text-gray-400">{inc.timestamp}</td>
+                          <td className="p-3 text-white">{inc.camera}</td>
+                          <td className="p-3 text-gray-200 font-sans font-medium">{inc.behavior}</td>
+                          <td className="p-3">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              inc.severity === 'CRITICAL' ? 'bg-red-950 text-red-400 border border-red-800' : 'bg-amber-950 text-amber-400 border border-amber-800'
+                            }`}>{inc.severity}</span>
+                          </td>
+                          <td className="p-3 text-emerald-400">${inc.stolenEstimate?.toFixed(2) || '0.00'}</td>
+                          <td className="p-3">
+                            <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-300 text-[10px]">{inc.status}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {currentTab === 'analytics' && (
+              <div className="space-y-6 max-w-6xl mx-auto">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                    <span className="text-gray-400 text-xs font-mono block">PREVENTED SHRINKAGE</span>
+                    <span className="text-2xl font-bold font-mono text-emerald-400 mt-2 block">$1,845.50</span>
+                    <span className="text-[11px] text-gray-500 font-mono">Recovered value today</span>
+                  </div>
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                    <span className="text-gray-400 text-xs font-mono block">FLAGGED THREATS</span>
+                    <span className="text-2xl font-bold font-mono text-red-400 mt-2 block">{incidents.length + activeAlerts.length}</span>
+                    <span className="text-[11px] text-gray-500 font-mono">High-confidence triggers</span>
+                  </div>
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                    <span className="text-gray-400 text-xs font-mono block">AVG GUARD RESPONSE</span>
+                    <span className="text-2xl font-bold font-mono text-cyan-400 mt-2 block">19.4s</span>
+                    <span className="text-[11px] text-gray-500 font-mono">Interception dispatch</span>
+                  </div>
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                    <span className="text-gray-400 text-xs font-mono block">AI MODEL ACCURACY</span>
+                    <span className="text-2xl font-bold font-mono text-indigo-400 mt-2 block">94.6%</span>
+                    <span className="text-[11px] text-gray-500 font-mono">Verified true positive</span>
+                  </div>
+                </div>
+
+                {/* Heatmap Blueprint */}
+                <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+                  <h3 className="text-xs font-mono font-bold text-gray-300 uppercase mb-4">Store Loss Prevention Blueprint Heatmap</h3>
+                  <div className="relative h-64 bg-slate-950 rounded-xl border border-gray-800 p-4">
+                    <div className="absolute top-4 left-6 p-3 bg-red-950/30 border border-red-500/60 rounded-lg">
+                      <span className="text-xs font-mono text-red-400 font-bold block">ZONE B // ELECTRONICS (31%)</span>
+                      <span className="text-[10px] text-gray-400">High-Shrinkage Audio/Phones</span>
+                    </div>
+                    <div className="absolute top-4 right-6 p-3 bg-red-950/40 border border-red-500/80 rounded-lg">
+                      <span className="text-xs font-mono text-red-400 font-bold block">ZONE C // COSMETICS (38%)</span>
+                      <span className="text-[10px] text-gray-400">Fragrance Island Hotspot</span>
+                    </div>
+                    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 p-3 bg-cyan-950/30 border border-cyan-500/60 rounded-lg text-center">
+                      <span className="text-xs font-mono text-cyan-400 font-bold block">ZONE A & F // REGISTERS & EXIT PEDESTALS</span>
+                      <span className="text-[10px] text-gray-400">Turnstiles & EAS Gate Scanner</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* Guard Dispatch Modal */}
+          {selectedAlertForDispatch && (
+            <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+              <div className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-md p-6 space-y-4 shadow-2xl">
+                <div className="flex justify-between items-center border-b border-gray-800 pb-3">
+                  <h3 className="text-sm font-bold text-white font-mono">DISPATCH FLOOR GUARD</h3>
+                  <button onClick={() => setSelectedAlertForDispatch(null)} className="text-gray-400 hover:text-white">✕</button>
+                </div>
+
+                <div className="p-3 bg-red-950/30 border border-red-500/40 rounded-lg text-xs font-mono">
+                  <span className="text-red-400 font-bold block">{selectedAlertForDispatch.behavior}</span>
+                  <span className="text-gray-300 block mt-0.5">{selectedAlertForDispatch.location}</span>
+                </div>
+
+                <div>
+                  <label className="text-xs font-mono text-gray-300 block mb-1.5">Assign Patrolling Officer:</label>
+                  <select
+                    value={dispatchGuardId}
+                    onChange={(e) => setDispatchGuardId(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-lg p-2 text-xs text-white"
+                  >
+                    {GUARDS.map(g => (
+                      <option key={g.id} value={g.id}>{g.name} ({g.location})</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-xs font-mono text-gray-300 block mb-1">Radio Order:</label>
+                  <input
+                    type="text"
+                    value={dispatchNotes}
+                    onChange={(e) => setDispatchNotes(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-lg p-2 text-xs text-white"
+                  />
+                </div>
+
+                <div className="flex justify-end space-x-2 pt-2">
+                  <button onClick={() => setSelectedAlertForDispatch(null)} className="px-3 py-1.5 rounded-lg bg-gray-800 text-xs">Cancel</button>
+                  <button onClick={dispatchGuard} className="px-4 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold text-xs">Transmit Dispatch</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Footer */}
+          <footer className="bg-[#0B0F19] border-t border-gray-800 px-4 py-2 text-[11px] font-mono text-gray-500 flex justify-between">
+            <span>SENTINELSHIELD AI // ADAPTIVE THEFT DETECTION PLATFORM</span>
+            <span>STATUS: 6 FEEDS ACTIVE • AES-256</span>
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
